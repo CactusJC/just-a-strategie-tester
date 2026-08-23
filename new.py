@@ -8,7 +8,14 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import gc
 import itertools
 from datetime import datetime, timezone, timedelta
-import MetaTrader5 as mt5
+
+try:
+    import MetaTrader5 as mt5
+    HAS_MT5 = True
+except ImportError:
+    mt5 = None
+    HAS_MT5 = False
+
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
@@ -25,7 +32,7 @@ SYMBOLS = ["MSFT", "EURUSD", "XAUUSD", "BTCUSD.nx", "USOIL.c", "NACUSD.c"]
 
 # Standaard backtestperiode: de laatste 6 maanden t/m nu.
 BACKTEST_MONTHS = 6
-TIMEFRAME = mt5.TIMEFRAME_M5
+TIMEFRAME = mt5.TIMEFRAME_M5 if (HAS_MT5 and mt5 is not None) else 5
 
 # Map waarin cache-bestanden (.parquet / .csv) per symbool worden weggeschreven.
 CACHE_DIR = "cache"
@@ -46,6 +53,12 @@ BEST_DAY_MAX_SHARE_OF_PROFIT = 0.20  # Best Day Rule (soft): max 20% per dag
 
 PAYOUT_SCHEDULE = [100.0, 100.0, 150.0, 200.0, 250.0, 315.0, 375.0]
 
+# --- VANGUARD PROHIBITED BEHAVIOR RULES (GEHANDHAAFD IN ENGINE) --------------
+# 1. Geen Grid Trading (geen order-grids rond prijsniveaus)
+# 2. Geen DCA / Averaging Out Losses (strikt 1 positie tegelijk, geen layering)
+# 3. Geen Tick Scalping of High-Frequency Trading (HFT) (minimaal M5 candles + ATR TP/SL)
+# 4. Geen Latency Arbitrage / Hedging
+
 
 # ==============================================================================
 # 1. NUMBA TRADE MANAGEMENT ENGINE (Razendsnelle C-compiler)
@@ -54,7 +67,11 @@ PAYOUT_SCHEDULE = [100.0, 100.0, 150.0, 200.0, 250.0, 315.0, 375.0]
 def process_trades_numba(
     close, high, low, raw_entries, sl_points_arr, tp_points_arr
 ):
-    """Verwerkt per kolom de regels voor Stop-Loss (SL) en Take-Profit (TP)"""
+    """
+    Verwerkt per kolom de regels voor Stop-Loss (SL) en Take-Profit (TP).
+    Handhaaft strikt 'Single Position Execution': er kan maximaal EEN positie tegelijk
+    openstaan. Geen layering, geen DCA / loss averaging en geen grid orders.
+    """
     n_bars, n_combos = raw_entries.shape
     entries = np.zeros((n_bars, n_combos), dtype=np.bool_)
     exits = np.zeros((n_bars, n_combos), dtype=np.bool_)
@@ -93,6 +110,9 @@ def fetch_mt5_data_by_dates(
     symbol: str, timeframe, date_from: datetime, date_to: datetime
 ) -> pd.DataFrame:
     """Haalt MT5 historie op tussen twee exacte datums."""
+    if not HAS_MT5 or mt5 is None:
+        raise RuntimeError("MetaTrader5 package is niet geïnstalleerd of niet beschikbaar in deze omgeving.")
+
     if not mt5.initialize():
         raise RuntimeError(f"MT5 initialisatie mislukt. Foutcode: {mt5.last_error()}")
 
@@ -204,21 +224,35 @@ def evaluate_prop_firm_rules(daily_stats: pd.DataFrame, equity: pd.Series, trade
 
     daily_violations = daily_stats[daily_stats["dd_pct"] >= DAILY_DD_PCT]
 
-    overall_dd_pct = (initial_capital - equity.cummin()) / initial_capital * 100.0
-    overall_violation_dates = equity.index[overall_dd_pct >= MAX_OVERALL_LOSS_PCT]
+    exact_daily_violation_times = []
+    for day_dt in daily_violations.index:
+        day_equity = equity[equity.index.date == day_dt.date()]
+        if not day_equity.empty:
+            day_open = day_equity.iloc[0]
+            breach = day_equity[(day_open - day_equity) / day_open * 100.0 >= DAILY_DD_PCT]
+            if not breach.empty:
+                exact_daily_violation_times.append(pd.Timestamp(breach.index[0]))
+            else:
+                exact_daily_violation_times.append(pd.Timestamp(day_dt))
 
-    single_trade_violations = trades_pnl[trades_pnl <= -(MAX_SINGLE_TRADE_LOSS_PCT / 100.0) * initial_capital]
+    overall_violation_dates = equity.index[(initial_capital - equity) / initial_capital * 100.0 >= MAX_OVERALL_LOSS_PCT]
+
+    if trades_pnl is not None and not trades_pnl.empty:
+        single_trade_violations = trades_pnl[trades_pnl <= -(MAX_SINGLE_TRADE_LOSS_PCT / 100.0) * initial_capital]
+    else:
+        single_trade_violations = pd.Series(dtype=float)
 
     blown_candidates = []
-    if len(daily_violations) > 0:
-        blown_candidates.append(pd.Timestamp(daily_violations.index[0]))
+    if len(exact_daily_violation_times) > 0:
+        blown_candidates.append(exact_daily_violation_times[0])
     if len(overall_violation_dates) > 0:
         blown_candidates.append(pd.Timestamp(overall_violation_dates[0]))
     if len(single_trade_violations) > 0:
         first_bad_trade_date = single_trade_violations.index[0]
-        if not isinstance(first_bad_trade_date, pd.Timestamp):
-            first_bad_trade_date = equity.index[0]
-        blown_candidates.append(pd.Timestamp(first_bad_trade_date))
+        try:
+            blown_candidates.append(pd.Timestamp(first_bad_trade_date))
+        except Exception:
+            blown_candidates.append(pd.Timestamp(equity.index[0]))
 
     account_blown = len(blown_candidates) > 0
     blown_date = min(blown_candidates) if blown_candidates else None
@@ -321,6 +355,7 @@ def print_payout_summary(symbol: str, rule_eval: dict, payouts: list, challenge_
     print("\n" + "=" * 70)
     print(f" PAYOUT SUMMARY - {symbol}")
     print("=" * 70)
+    print(" ✔ Handhaving regels: Single Position (Geen Grid/DCA), M5 Trend (Geen Scalping/HFT/Arbitrage)")
     if len(rule_eval["daily_violations"]) > 0:
         print(f" ⚠ Daily Drawdown (4%) overtreden op {len(rule_eval['daily_violations'])} dag(en).")
     if len(rule_eval["overall_violation_dates"]) > 0:
@@ -377,7 +412,6 @@ def main():
         print("\n[2/5] Technische indicatoren berekenen...")
         rsi_10_arr = ta.rsi(df["Close"], length=10).fillna(50).values
         rsi_14_arr = ta.rsi(df["Close"], length=14).fillna(50).values
-        rsi_21_arr = ta.rsi(df["Close"], length=21).fillna(50).values
 
         ema9 = ta.ema(df["Close"], length=9)
         ema21 = ta.ema(df["Close"], length=21)
@@ -406,25 +440,19 @@ def main():
         cond_stoch_arr = ((stoch.iloc[:, 0] > stoch.iloc[:, 1]) & (stoch.iloc[:, 0] < 80)).values
 
         print("\n[3/5] Parameter Grid opbouwen...")
-        rsi_len_opts = [10, 14, 21]
-        rsi_thresh_opts = [30, 40, 50, 60]
+        rsi_len_opts = [10, 14]
+        rsi_thresh_opts = [30, 40, 50]
         ema_pair_opts = ["9/21", "12/26", "20/50"]
         ema_trend_opts = [50, 100, 200]
-        min_agree_opts = [3, 4, 5, 6]
+        min_agree_opts = [4, 5, 6]
 
         last_close = close_arr[-1]
-        if last_close < 5.0:
-            sl_points_opts = [0.0005, 0.0010, 0.0015, 0.0020]
-            tp_points_opts = [0.0010, 0.0020, 0.0030, 0.0050]
-        elif last_close > 15000:
-            sl_points_opts = [10.0, 25.0, 50.0, 100.0]
-            tp_points_opts = [20.0, 50.0, 100.0, 200.0]
-        elif last_close > 1000:
-            sl_points_opts = [1.0, 3.0, 5.0, 10.0]
-            tp_points_opts = [2.0, 6.0, 10.0, 20.0]
-        else:
-            sl_points_opts = [0.25, 0.5, 1.0, 2.0]
-            tp_points_opts = [0.5, 1.0, 2.0, 5.0]
+        atr_series = ta.atr(df["High"], df["Low"], df["Close"], length=14)
+        atr_val = atr_series.dropna().iloc[-1] if atr_series is not None and not atr_series.dropna().empty else last_close * 0.01
+        dec_places = 4 if last_close < 10 else 2
+
+        sl_points_opts = [float(np.round(m * atr_val, dec_places)) for m in [0.8, 1.5, 2.5, 4.0]]
+        tp_points_opts = [float(np.round(m * atr_val, dec_places)) for m in [1.5, 3.0, 5.0, 8.0]]
 
         param_grid = list(itertools.product(rsi_len_opts, rsi_thresh_opts, ema_pair_opts, ema_trend_opts, min_agree_opts, sl_points_opts, tp_points_opts))
 
@@ -436,7 +464,7 @@ def main():
         tp_arr = np.zeros(n_combos, dtype=np.float64)
 
         for i, (rsi_len, rsi_val, ema_pair, trend_len, min_agree, sl_pts, tp_pts) in enumerate(param_grid):
-            rsi_arr = rsi_10_arr if rsi_len == 10 else (rsi_14_arr if rsi_len == 14 else rsi_21_arr)
+            rsi_arr = rsi_10_arr if rsi_len == 10 else rsi_14_arr
             c_rsi = rsi_arr < rsi_val
             c_ema = cond_ema_9_21 if ema_pair == "9/21" else (cond_ema_12_26 if ema_pair == "12/26" else cond_ema_20_50)
             c_trend = cond_trend_50 if trend_len == 50 else (cond_trend_100 if trend_len == 100 else cond_trend_200)
@@ -474,12 +502,12 @@ def main():
             )
 
             pf_trades = pf_chunk.trades
-            
+
             try:
                 pf_win_rate = (pf_trades.win_rate() * 100.0).round(2)
             except Exception:
                 pf_win_rate = pd.Series(0.0, index=chunk_index)
-                
+
             try:
                 pf_pf = pf_trades.profit_factor()
                 if isinstance(pf_pf, pd.Series):
@@ -496,7 +524,7 @@ def main():
                 "Max Drawdown (%)": (pf_chunk.max_drawdown() * 100.0).round(2),
                 "Profit Factor": pf_pf,
             })
-            
+
             all_summary_list.append(res_chunk)
             del pf_chunk
             gc.collect()
@@ -508,52 +536,114 @@ def main():
             print(f"\n -> Geen trades voor {SYMBOL}. Volgende...\n")
             continue
 
-        top50 = results_df.sort_values(by="Return (%)", ascending=False).head(50)
-        best_combo = top50.index[0]
+        rule_compliant = results_df[(results_df["Max Drawdown (%)"].abs() < MAX_OVERALL_LOSS_PCT) & (results_df["Return (%)"] > 0) & (results_df["Total Trades"] >= 5)]
 
-        best_idx = param_grid.index(best_combo)
-        single_entries, single_exits = process_trades_numba(
-            close_arr, high_arr, low_arr, 
-            raw_entries_matrix[:, best_idx:best_idx+1], 
-            sl_arr[best_idx:best_idx+1], 
-            tp_arr[best_idx:best_idx+1]
-        )
+        candidates = rule_compliant.sort_values(by="Return (%)", ascending=False).head(15) if not rule_compliant.empty else results_df.sort_values(by="Return (%)", ascending=False).head(15)
 
-        best_pf = vbt.Portfolio.from_signals(
-            close=df["Close"],
-            entries=pd.DataFrame(single_entries, index=df.index, columns=[best_combo]),
-            exits=pd.DataFrame(single_exits, index=df.index, columns=[best_combo]),
-            freq="5m",
-            fees=spread_fee_series,
-            init_cash=INITIAL_CAPITAL,
-        )
+        best_combo = candidates.index[0]
+        best_payout_total = -1.0
+        best_rule_eval = None
+        best_payouts = None
 
-        equity_curve = best_pf.value()
-        if isinstance(equity_curve, pd.DataFrame):
-            equity_curve = equity_curve.iloc[:, 0]
+        for candidate_combo in candidates.index:
+            c_idx = param_grid.index(candidate_combo)
+            c_entries, c_exits = process_trades_numba(
+                close_arr, high_arr, low_arr,
+                raw_entries_matrix[:, c_idx:c_idx+1],
+                sl_arr[c_idx:c_idx+1],
+                tp_arr[c_idx:c_idx+1]
+            )
 
-        trades_readable = best_pf.trades.records_readable
-        if "Exit Timestamp" in trades_readable.columns and "PnL" in trades_readable.columns:
-            trades_pnl = trades_readable.set_index("Exit Timestamp")["PnL"]
-        else:
-            trades_pnl = pd.Series(best_pf.trades.pnl.values if hasattr(best_pf.trades.pnl, "values") else best_pf.trades.pnl, index=equity_curve.index[:len(best_pf.trades.pnl)])
+            c_pf = vbt.Portfolio.from_signals(
+                close=df["Close"],
+                entries=pd.DataFrame(c_entries, index=df.index, columns=[candidate_combo]),
+                exits=pd.DataFrame(c_exits, index=df.index, columns=[candidate_combo]),
+                freq="5m",
+                fees=spread_fee_series,
+                init_cash=INITIAL_CAPITAL,
+            )
 
-        if hasattr(best_pf, "shares"):
-            position_data = best_pf.shares
-        elif hasattr(best_pf, "holding_shares"):
-            position_data = best_pf.holding_shares
-        else:
-            position_data = pd.Series(0, index=df.index)
+            c_equity = c_pf.value()
+            if isinstance(c_equity, pd.DataFrame):
+                c_equity = c_equity.iloc[:, 0]
 
-        if isinstance(position_data, pd.DataFrame):
-            position_data = position_data.iloc[:, 0]
-        
-        position_mask = position_data != 0
+            c_trades_readable = c_pf.trades.records_readable
+            if not c_trades_readable.empty and "Exit Timestamp" in c_trades_readable.columns and "PnL" in c_trades_readable.columns:
+                c_trades_pnl = c_trades_readable.set_index("Exit Timestamp")["PnL"]
+                if not isinstance(c_trades_pnl.index, pd.DatetimeIndex):
+                    c_trades_pnl.index = pd.to_datetime(c_trades_pnl.index)
+            else:
+                c_trades_pnl = pd.Series(dtype=float)
 
-        daily_stats = compute_daily_stats(equity_curve)
-        rule_eval = evaluate_prop_firm_rules(daily_stats, equity_curve, trades_pnl, INITIAL_CAPITAL)
-        payout_result = simulate_payouts(equity_curve, position_mask, daily_stats, INITIAL_CAPITAL, rule_eval["blown_date"])
-        print_payout_summary(SYMBOL, rule_eval, payout_result, CHALLENGE_FEE)
+            if hasattr(c_pf, "shares"):
+                c_pos = c_pf.shares
+            elif hasattr(c_pf, "holding_shares"):
+                c_pos = c_pf.holding_shares
+            else:
+                c_pos = pd.Series(0, index=df.index)
+
+            if isinstance(c_pos, pd.DataFrame):
+                c_pos = c_pos.iloc[:, 0]
+
+            c_pos_mask = c_pos != 0
+
+            c_daily = compute_daily_stats(c_equity)
+            c_eval = evaluate_prop_firm_rules(c_daily, c_equity, c_trades_pnl, INITIAL_CAPITAL)
+            c_payouts = simulate_payouts(c_equity, c_pos_mask, c_daily, INITIAL_CAPITAL, c_eval["blown_date"])
+
+            c_total_payout = sum(p["amount"] for p in c_payouts) if c_payouts else 0.0
+
+            if not c_eval["account_blown"] and c_total_payout > best_payout_total:
+                best_payout_total = c_total_payout
+                best_combo = candidate_combo
+                best_rule_eval = c_eval
+                best_payouts = c_payouts
+
+        if best_rule_eval is None:
+            c_idx = param_grid.index(best_combo)
+            c_entries, c_exits = process_trades_numba(
+                close_arr, high_arr, low_arr,
+                raw_entries_matrix[:, c_idx:c_idx+1],
+                sl_arr[c_idx:c_idx+1],
+                tp_arr[c_idx:c_idx+1]
+            )
+            fallback_pf = vbt.Portfolio.from_signals(
+                close=df["Close"],
+                entries=pd.DataFrame(c_entries, index=df.index, columns=[best_combo]),
+                exits=pd.DataFrame(c_exits, index=df.index, columns=[best_combo]),
+                freq="5m",
+                fees=spread_fee_series,
+                init_cash=INITIAL_CAPITAL,
+            )
+            c_equity = fallback_pf.value()
+            if isinstance(c_equity, pd.DataFrame):
+                c_equity = c_equity.iloc[:, 0]
+
+            c_trades_readable = fallback_pf.trades.records_readable
+            if not c_trades_readable.empty and "Exit Timestamp" in c_trades_readable.columns and "PnL" in c_trades_readable.columns:
+                c_trades_pnl = c_trades_readable.set_index("Exit Timestamp")["PnL"]
+                if not isinstance(c_trades_pnl.index, pd.DatetimeIndex):
+                    c_trades_pnl.index = pd.to_datetime(c_trades_pnl.index)
+            else:
+                c_trades_pnl = pd.Series(dtype=float)
+
+            if hasattr(fallback_pf, "shares"):
+                c_pos = fallback_pf.shares
+            elif hasattr(fallback_pf, "holding_shares"):
+                c_pos = fallback_pf.holding_shares
+            else:
+                c_pos = pd.Series(0, index=df.index)
+
+            if isinstance(c_pos, pd.DataFrame):
+                c_pos = c_pos.iloc[:, 0]
+            c_pos_mask = c_pos != 0
+
+            c_daily = compute_daily_stats(c_equity)
+            best_rule_eval = evaluate_prop_firm_rules(c_daily, c_equity, c_trades_pnl, INITIAL_CAPITAL)
+            best_payouts = simulate_payouts(c_equity, c_pos_mask, c_daily, INITIAL_CAPITAL, best_rule_eval["blown_date"])
+
+        print(f" -> Gekozen strategie parameters: {best_combo}")
+        print_payout_summary(SYMBOL, best_rule_eval, best_payouts, CHALLENGE_FEE)
 
 
 if __name__ == "__main__":
