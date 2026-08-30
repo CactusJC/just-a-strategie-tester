@@ -1,0 +1,8 @@
+vectorbt
+numba
+pandas
+pandas_ta
+numpy
+scipy
+scikit-learn
+plotly<6.0.0
